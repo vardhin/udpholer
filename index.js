@@ -2,6 +2,43 @@
 const dgram = require('dgram');
 const crypto = require('crypto');
 const readline = require('readline');
+const https = require('https');
+
+// Add colors for beautiful logging
+const colors = {
+  reset: "\x1b[0m",
+  bright: "\x1b[1m",
+  red: "\x1b[31m",
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+  blue: "\x1b[34m",
+  magenta: "\x1b[35m",
+  cyan: "\x1b[36m"
+};
+
+// Enhanced logging function
+function log(type, message) {
+  const timestamp = new Date().toISOString();
+  switch(type) {
+    case 'info':
+      console.log(`${colors.cyan}[${timestamp}] ℹ️  ${message}${colors.reset}`);
+      break;
+    case 'success':
+      console.log(`${colors.green}[${timestamp}] ✅ ${message}${colors.reset}`);
+      break;
+    case 'error':
+      console.log(`${colors.red}[${timestamp}] ❌ ${message}${colors.reset}`);
+      break;
+    case 'warning':
+      console.log(`${colors.yellow}[${timestamp}] ⚠️  ${message}${colors.reset}`);
+      break;
+    case 'attack':
+      console.log(`${colors.magenta}[${timestamp}] 🎯 ${message}${colors.reset}`);
+      break;
+    default:
+      console.log(`[${timestamp}] ${message}`);
+  }
+}
 
 /**
  * Send a STUN Binding Request to obtain your public IP and port.
@@ -88,65 +125,216 @@ function parseStunResponse(msg) {
   throw new Error("XOR-MAPPED-ADDRESS attribute not found");
 }
 
+// Simplified time handling - use local time
+function getCurrentTime() {
+  const now = new Date();
+  const currentHour = now.getHours();
+  const currentMinute = now.getMinutes();
+  const currentSecond = now.getSeconds();
+  const ampm = currentHour >= 12 ? 'PM' : 'AM';
+  const hour12 = currentHour % 12 || 12;
+  
+  return {
+    now,
+    currentHour,
+    currentMinute,
+    currentSecond,
+    hour12,
+    ampm
+  };
+}
+
 // Create a UDP socket
 const socket = dgram.createSocket('udp4');
 
 // Bind the socket (letting the OS pick an available port)
 socket.bind(() => {
   const localAddr = socket.address();
-  console.log('Local socket bound on', localAddr);
+  log('info', `Local socket bound on ${JSON.stringify(localAddr)}`);
 
   // Use a STUN server to get the public IP and port
   stunRequest(socket, 'stun.l.google.com', 19302, (err, res) => {
     if (err) {
-      console.error('STUN request failed:', err);
+      log('error', `STUN request failed: ${err.message}`);
       process.exit(1);
     }
-    console.log(`Your public IP: ${res.ip} and public port: ${res.port}`);
+    log('success', `Your public IP: ${res.ip} and public port: ${res.port}`);
 
-    // Set up readline to ask for your friend's public details
     const rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout
     });
 
-    rl.question("Enter friend's public IP: ", (friendIP) => {
-      rl.question("Enter friend's public port: ", (friendPortStr) => {
+    rl.question(`${colors.cyan}Enter friend's public IP: ${colors.reset}`, (friendIP) => {
+      rl.question(`${colors.cyan}Enter friend's public port: ${colors.reset}`, async (friendPortStr) => {
         const friendPort = parseInt(friendPortStr, 10);
-        console.log(`Starting UDP hole punching to ${friendIP}:${friendPort} ...`);
+        
+        // Validate port number
+        if (isNaN(friendPort) || friendPort <= 0 || friendPort >= 65536) {
+          log('error', 'Invalid port number. Port must be between 1 and 65535');
+          process.exit(1);
+        }
+        
+        // Get and display current time
+        const time = getCurrentTime();
+        log('info', `Current time: ${time.currentHour}:${time.currentMinute.toString().padStart(2, '0')}:${time.currentSecond.toString().padStart(2, '0')} (24hr)`);
+        log('info', `           : ${time.hour12}:${time.currentMinute.toString().padStart(2, '0')}:${time.currentSecond.toString().padStart(2, '0')} ${time.ampm}`);
+        
+        rl.question(`${colors.cyan}Enter target minute (0-59) for attack: ${colors.reset}`, (targetMinute) => {
+          const minute = parseInt(targetMinute);
+          
+          if (isNaN(minute) || minute < 0 || minute > 59) {
+            log('error', 'Invalid minute. Please enter a number between 0 and 59');
+            process.exit(1);
+          }
 
-        let connected = false;
+          const targetTime = new Date(time.now);
+          targetTime.setMinutes(minute);
+          targetTime.setSeconds(0);
+          targetTime.setMilliseconds(0);
 
-        // Listen for incoming UDP messages on this socket
-        socket.on('message', (msg, rinfo) => {
-          if (rinfo.address === friendIP && rinfo.port === friendPort) {
-            console.log(`Received message from friend ${rinfo.address}:${rinfo.port}: ${msg.toString()}`);
-            if (!connected) {
-              connected = true;
-              console.log('Hole punching successful. You can now chat!');
-              // In chat mode, every new line typed is sent to your friend.
-              rl.on('line', (line) => {
-                socket.send(line, friendPort, friendIP, (err) => {
-                  if (err) console.error('Send error:', err);
-                });
-              });
+          // If target minute is earlier than current minute, move to next hour
+          if (minute <= time.currentMinute) {
+            targetTime.setHours(targetTime.getHours() + 1);
+          }
+
+          const delayToTarget = targetTime.getTime() - time.now.getTime();
+          const countdown = Math.round(delayToTarget / 1000);
+
+          log('attack', `Attack scheduled for: ${targetTime.toLocaleTimeString()}`);
+          log('info', `Time until attack: ${Math.floor(countdown/60)}m ${countdown%60}s`);
+          
+          let packetCount = 0;
+          let connected = false;
+          let lastMessageTime = Date.now();
+          let keepAliveInterval;
+          let punchInterval;
+
+          // Start countdown display
+          let remainingSeconds = countdown;
+          const countdownInterval = setInterval(() => {
+            remainingSeconds--;
+            if (remainingSeconds > 0) {
+              if (remainingSeconds <= 10) {
+                  log('warning', `Attack starting in ${remainingSeconds} seconds...`);
+              } else if (remainingSeconds % 30 === 0) {
+                  // Update every 30 seconds
+                  log('info', `${Math.floor(remainingSeconds/60)}m ${remainingSeconds%60}s remaining`);
+              }
             }
-          }
-        });
+          }, 1000);
 
-        // Send 100 UDP "punch" packets at intervals of 100ms
-        let count = 0;
-        const interval = setInterval(() => {
-          if (count < 100) {
-            const message = `Punch ${count}`;
-            socket.send(message, friendPort, friendIP, (err) => {
-              if (err) console.error('Error sending punch:', err);
-            });
-            count++;
-          } else {
-            clearInterval(interval);
+          // Schedule the precise attack
+          setTimeout(() => {
+            clearInterval(countdownInterval);
+            log('attack', '🚀 ATTACK INITIATED! 🚀');
+            
+            // Enhanced hole punching with packet logging
+            let packetCount = 0;
+            let connected = false;
+            let attempt = 0;
+            const maxAttempts = 10;
+            const baseDelay = 100; // Start with 100ms
+
+            const punch = () => {
+              if (attempt >= maxAttempts || connected) {
+                if (punchInterval) {
+                  clearInterval(punchInterval);
+                  punchInterval = null;
+                }
+                if (!connected) {
+                  log('error', 'Failed to establish connection after maximum attempts');
+                }
+                return;
+              }
+
+              packetCount++;
+              const message = JSON.stringify({
+                type: 'punch',
+                attempt: attempt + 1,
+                timestamp: Date.now()
+              });
+
+              socket.send(message, friendPort, friendIP, (err) => {
+                if (err) {
+                  log('error', `Packet #${packetCount} failed: ${err.message}`);
+                } else {
+                  log('info', `Packet #${packetCount} sent (attempt ${attempt + 1}/${maxAttempts})`);
+                }
+              });
+
+              attempt++;
+            };
+
+            punchInterval = setInterval(punch, baseDelay);
+            punch(); // Send first punch immediately
+          }, delayToTarget);
+
+          // Message handler
+          socket.on('message', (msg, rinfo) => {
+            if (rinfo.address === friendIP && rinfo.port === friendPort) {
+              lastMessageTime = Date.now();
+              
+              if (punchInterval) {
+                clearInterval(punchInterval);
+                punchInterval = null;
+              }
+              
+              try {
+                const message = msg.toString();
+                if (message === 'keep-alive') {
+                  log('info', 'Keep-alive received');
+                  return;
+                }
+                
+                if (!connected) {
+                  connected = true;
+                  log('success', 'Connection established! You can now chat.');
+                  startKeepAlive();
+                  
+                  rl.on('line', (line) => {
+                    if (line.trim()) {
+                      socket.send(line, friendPort, friendIP, (err) => {
+                        if (err) log('error', `Send error: ${err.message}`);
+                      });
+                    }
+                  });
+                }
+                
+                try {
+                  const parsed = JSON.parse(message);
+                  if (parsed.type !== 'punch') {
+                    log('info', `Friend: ${message}`);
+                  }
+                } catch {
+                  log('info', `Friend: ${message}`);
+                }
+              } catch (e) {
+                log('error', `Error processing message: ${e.message}`);
+              }
+            }
+          });
+
+          // Keep-alive mechanism
+          function startKeepAlive() {
+            if (keepAliveInterval) clearInterval(keepAliveInterval);
+            keepAliveInterval = setInterval(() => {
+              socket.send('keep-alive', friendPort, friendIP, (err) => {
+                if (err) log('error', `Keep-alive error: ${err.message}`);
+              });
+            }, 5000); // Send keep-alive every 5 seconds
           }
-        }, 100);
+
+          // Cleanup on exit
+          process.on('SIGINT', () => {
+            log('info', '\nClosing connection...');
+            if (keepAliveInterval) clearInterval(keepAliveInterval);
+            if (punchInterval) clearInterval(punchInterval);
+            socket.close();
+            rl.close();
+            process.exit(0);
+          });
+        });
       });
     });
   });
